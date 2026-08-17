@@ -3,9 +3,11 @@ package cn.qaiu.lz;
 import cn.qaiu.WebClientVertxInit;
 import cn.qaiu.db.pool.JDBCPoolInit;
 import cn.qaiu.lz.common.cache.CacheConfigLoader;
+import cn.qaiu.lz.common.cache.CacheManager;
 import cn.qaiu.lz.common.interceptorImpl.RateLimiter;
 import cn.qaiu.lz.web.config.PlaygroundConfig;
 import cn.qaiu.lz.web.service.DbService;
+import cn.qaiu.lz.web.service.impl.ShoutServiceImpl;
 import cn.qaiu.parser.custom.CustomParserConfig;
 import cn.qaiu.parser.custom.CustomParserRegistry;
 import cn.qaiu.parser.customjs.JsScriptMetadataParser;
@@ -20,7 +22,10 @@ import io.vertx.core.json.jackson.DatabindCodec;
 import io.vertx.core.shareddata.LocalMap;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.time.DateFormatUtils;
+import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Date;
 
 import static cn.qaiu.vx.core.util.ConfigConstant.LOCAL;
@@ -36,8 +41,45 @@ import static cn.qaiu.vx.core.util.ConfigConstant.LOCAL;
 public class AppMain {
 
     public static void main(String[] args) {
+        applyRuntimeLogLevelOverride();
+        Deploy deploy = Deploy.instance();
+        // 先阻断应用级定时任务，再让 Vert.x 停入口和 verticle。
+        deploy.addPreShutdownTask(CacheManager::cancelPeriodicCleanup);
+        deploy.addPreShutdownTask(ShoutServiceImpl::cancelCleanup);
+        // Vert.x 停完后再关数据库和解析器共享资源，避免请求还在路上就先关底层 client。
+        deploy.addPostShutdownTask(() -> JDBCPoolInit.instance().close());
+        deploy.addPostShutdownTask(cn.qaiu.parser.customjs.JsParserExecutor::shutdownExecutor);
+        deploy.addPostShutdownTask(cn.qaiu.parser.customjs.JsPlaygroundExecutor::shutdownPools);
+        deploy.addPostShutdownTask(cn.qaiu.parser.customjs.JsHttpClient::shutdownSharedClient);
+        deploy.addPostShutdownTask(cn.qaiu.parser.PanBase::shutdownSharedClients);
+        deploy.addPostShutdownTask(cn.qaiu.parser.IPanTool::shutdownCloseAfterScheduler);
+        deploy.addPostShutdownTask(cn.qaiu.parser.impl.PodTool::shutdownWorkerExecutor);
         // start
-        Deploy.instance().start(args, AppMain::exec);
+        deploy.start(args, AppMain::exec);
+    }
+
+    private static void applyRuntimeLogLevelOverride() {
+        String levelName = System.getProperty("NFD_LOG_LEVEL");
+        if (levelName == null || levelName.isBlank()) {
+            levelName = System.getenv("NFD_LOG_LEVEL");
+        }
+        if (levelName == null || levelName.isBlank()) {
+            return;
+        }
+        try {
+            var level = ch.qos.logback.classic.Level.toLevel(levelName, null);
+            if (level == null) {
+                log.warn("忽略无效的 NFD_LOG_LEVEL: {}", levelName);
+                return;
+            }
+            var logger = LoggerFactory.getLogger("cn.qaiu");
+            if (logger instanceof ch.qos.logback.classic.Logger logbackLogger) {
+                logbackLogger.setLevel(level);
+                log.info("cn.qaiu 日志级别已覆盖为 {}", level);
+            }
+        } catch (Exception e) {
+            log.warn("覆盖 cn.qaiu 日志级别失败: {}", e.getMessage());
+        }
     }
 
     /**
@@ -49,6 +91,8 @@ public class AppMain {
     private static void exec(JsonObject jsonObject) {
         WebClientVertxInit.init(VertxHolder.getVertxInstance());
         DatabindCodec.mapper().registerModule(new JavaTimeModule());
+        // 演练场配置要先加载，后续启动流程才能按开关决定是否注册动态解析器。
+        PlaygroundConfig.loadFromJson(jsonObject);
         // 限流
         if (jsonObject.containsKey("rateLimit")) {
             JsonObject rateLimit = jsonObject.getJsonObject("rateLimit");
@@ -64,9 +108,40 @@ public class AppMain {
                             System.out.println("数据库连接成功");
                             
                             // 加载演练场解析器
-                            loadPlaygroundParsers();
-                            
                             String addr = jsonObject.getJsonObject(ConfigConstant.SERVER).getString("domainName");
+                            if (addr == null || addr.isBlank()) {
+                                addr = "http://127.0.0.1:" + jsonObject.getJsonObject(ConfigConstant.SERVER).getInteger("port", 6400);
+                            }
+                            // 读取代理配置获取前端页面端口（同步读取小文件，仅启动时执行一次）
+                            String proxyConfName = jsonObject.getString("proxyConf", "server-proxy");
+                            String pageAddr = addr;
+                            try {
+                                String configFile = proxyConfName + ".yml";
+                                // 与 Deploy 保持一致：优先当前目录，其次 resources/
+                                Path configPath = Path.of(configFile);
+                                if (!Files.exists(configPath)) {
+                                    configPath = Path.of("resources", configFile);
+                                }
+                                if (Files.exists(configPath)) {
+                                    String yamlContent = Files.readString(configPath);
+                                    // 匹配项目约定的 YAML 格式: "- listen: 8080"
+                                    java.util.regex.Matcher m = java.util.regex.Pattern
+                                            .compile("^\\s*-\\s+listen:\\s*(\\d+)", java.util.regex.Pattern.MULTILINE)
+                                            .matcher(yamlContent);
+                                    if (m.find()) {
+                                        int pagePort = Integer.parseInt(m.group(1));
+                                        pageAddr = "http://127.0.0.1:" + pagePort;
+                                    }
+                                }
+                            } catch (Exception e) {
+                                log.warn("读取代理配置失败，使用默认页面地址: {}", e.getMessage());
+                            }
+                            if (PlaygroundConfig.getInstance().isEnabled()) {
+                                loadPlaygroundParsers(pageAddr);
+                            } else {
+                                log.info("演练场功能已禁用，跳过加载演练场解析器");
+                                log.info("服务已启动，可通过 {} 访问页面", pageAddr);
+                            }
                             System.out.println("启动成功: \n本地服务地址: " + addr);
                         });
                     });
@@ -100,45 +175,39 @@ public class AppMain {
             JsonObject auths = jsonObject.getJsonObject(ConfigConstant.AUTHS);
             localMap.put(ConfigConstant.AUTHS, auths);
         }
-        
-        // 演练场配置
-        PlaygroundConfig.loadFromJson(jsonObject);
     }
     
     /**
      * 在启动时加载所有已发布的演练场解析器
      */
-    private static void loadPlaygroundParsers() {
+    private static void loadPlaygroundParsers(String accessAddr) {
         DbService dbService = AsyncServiceUtil.getAsyncServiceInstance(DbService.class);
         
-        dbService.getPlaygroundParserList().onSuccess(result -> {
+        dbService.getEnabledPlaygroundParsersForLoad().onSuccess(result -> {
             JsonArray parsers = result.getJsonArray("data");
             if (parsers != null) {
                 int loadedCount = 0;
                 for (int i = 0; i < parsers.size(); i++) {
                     JsonObject parser = parsers.getJsonObject(i);
                     
-                    // 只注册已启用的解析器
-                    if (parser.getBoolean("enabled", false)) {
-                        try {
-                            String jsCode = parser.getString("jsCode");
-                            if (jsCode == null || jsCode.trim().isEmpty()) {
-                                log.error("加载演练场解析器失败: {} - JavaScript代码为空", parser.getString("name"));
-                                continue;
-                            }
-                            CustomParserConfig config = JsScriptMetadataParser.parseScript(jsCode);
-                            CustomParserRegistry.register(config);
-                            loadedCount++;
-                            log.info("已加载演练场解析器: {} ({})", 
-                                    config.getDisplayName(), config.getType());
-                        } catch (Exception e) {
-                            String parserName = parser.getString("name");
-                            String errorMsg = e.getMessage();
-                            log.error("加载演练场解析器失败: {} - {}", parserName, errorMsg, e);
-                            // 如果是require相关错误，提供更详细的提示
-                            if (errorMsg != null && errorMsg.contains("require")) {
-                                log.error("提示：演练场解析器不支持CommonJS模块系统（require），请确保代码使用ES5.1语法");
-                            }
+                    try {
+                        String jsCode = parser.getString("jsCode");
+                        if (jsCode == null || jsCode.trim().isEmpty()) {
+                            log.error("加载演练场解析器失败: {} - JavaScript代码为空", parser.getString("name"));
+                            continue;
+                        }
+                        CustomParserConfig config = JsScriptMetadataParser.parseScript(jsCode);
+                        CustomParserRegistry.register(config);
+                        loadedCount++;
+                        log.info("已加载演练场解析器: {} ({})",
+                                config.getDisplayName(), config.getType());
+                    } catch (Exception e) {
+                        String parserName = parser.getString("name");
+                        String errorMsg = e.getMessage();
+                        log.error("加载演练场解析器失败: {} - {}", parserName, errorMsg, e);
+                        // 如果是require相关错误，提供更详细的提示
+                        if (errorMsg != null && errorMsg.contains("require")) {
+                            log.error("提示：演练场解析器不支持CommonJS模块系统（require），请确保代码使用ES5.1语法");
                         }
                     }
                 }
@@ -148,6 +217,8 @@ public class AppMain {
             }
         }).onFailure(e -> {
             log.error("加载演练场解析器列表失败", e);
+        }).onComplete(ar -> {
+            log.info("服务已启动，可通过 {} 访问页面", accessAddr);
         });
     }
 }

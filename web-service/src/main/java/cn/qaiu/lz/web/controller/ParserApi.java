@@ -5,6 +5,7 @@ import cn.qaiu.entity.FileInfo;
 import cn.qaiu.entity.ShareLinkInfo;
 import cn.qaiu.lz.common.cache.CacheManager;
 import cn.qaiu.lz.common.util.AuthParamCodec;
+import cn.qaiu.lz.common.util.ParserAuthUtil;
 import cn.qaiu.lz.common.util.URLParamUtil;
 import cn.qaiu.lz.web.model.AuthParam;
 import cn.qaiu.lz.web.model.CacheLinkInfo;
@@ -13,8 +14,11 @@ import cn.qaiu.lz.web.model.LinkInfoResp;
 import cn.qaiu.lz.web.model.StatisticsInfo;
 import cn.qaiu.lz.web.service.DbService;
 import cn.qaiu.parser.PanDomainTemplate;
+import cn.qaiu.parser.IPanTool;
 import cn.qaiu.parser.ParserCreate;
+import cn.qaiu.parser.clientlink.ClientLinkGeneratorFactory;
 import cn.qaiu.parser.clientlink.ClientLinkType;
+import cn.qaiu.util.CommonUtils;
 import cn.qaiu.vx.core.annotaions.RouteHandler;
 import cn.qaiu.vx.core.annotaions.RouteMapping;
 import cn.qaiu.vx.core.enums.RouteMethod;
@@ -43,28 +47,72 @@ public class ParserApi {
 
     private final DbService dbService = AsyncServiceUtil.getAsyncServiceInstance(DbService.class);
 
+    /**
+     * 获取链接前缀：优先用配置的 domainName，未配置则从请求头推断
+     * 支持反向代理：优先读 X-Forwarded-Host/X-Forwarded-Proto，再回退到 Host 头
+     */
+    private static String getLinkPrefix(HttpServerRequest request) {
+        String domainName = SharedDataUtil.getJsonConfig("server").getString("domainName");
+        if (StringUtils.isNotBlank(domainName)) {
+            return domainName;
+        }
+        if (request != null) {
+            // 反向代理场景：优先从转发头获取原始域名
+            String forwardedHost = request.getHeader("X-Forwarded-Host");
+            if (StringUtils.isNotBlank(forwardedHost)) {
+                String proto = request.getHeader("X-Forwarded-Proto");
+                if (StringUtils.isBlank(proto)) {
+                    proto = request.scheme();
+                }
+                return proto + "://" + forwardedHost;
+            }
+            return request.scheme() + "://" + request.host();
+        }
+        return "";
+    }
+
 
     @RouteMapping(value = "/statisticsInfo", method = RouteMethod.GET, order = 99)
     public Future<StatisticsInfo> statisticsInfo() {
         return dbService.getStatisticsInfo();
     }
 
-    private final CacheManager cacheManager = new CacheManager();
-    private final ServerApi serverApi = new ServerApi();
+    private static final CacheManager cacheManager = new CacheManager();
+    private static final ServerApi serverApi = new ServerApi();
+
+    @RouteMapping(value = "/check/:type/:key", method = RouteMethod.GET)
+    public void check(HttpServerResponse response, String type, String key) {
+        response.putHeader("Content-Type", "text/plain; charset=utf-8")
+                .setStatusCode(200)
+                .end("ok");
+    }
+
+    @RouteMapping(value = "/check/:type/:key", method = RouteMethod.HEAD)
+    public void checkHead(HttpServerResponse response, String type, String key) {
+        response.putHeader("Content-Type", "text/plain; charset=utf-8")
+                .setStatusCode(200)
+                .end();
+    }
 
     @RouteMapping(value = "/linkInfo", method = RouteMethod.GET)
     public Future<LinkInfoResp> parse(HttpServerRequest request, String pwd, String auth) {
         Promise<LinkInfoResp> promise = Promise.promise();
         String url = URLParamUtil.parserParams(request);
-        ParserCreate parserCreate = ParserCreate.fromShareUrl(url).setShareLinkInfoPwd(pwd);
+        ParserCreate parserCreate;
+        try {
+            parserCreate = ParserCreate.fromShareUrl(url).setShareLinkInfoPwd(pwd);
+        } catch (Exception e) {
+            return Future.failedFuture(e);
+        }
         ShareLinkInfo shareLinkInfo = parserCreate.getShareLinkInfo();
         
         // 构建链接信息响应，如果有 auth 参数则附加到链接中
         String authSuffix = (auth != null && !auth.isEmpty()) ? "&auth=" + auth : "";
+        shareLinkInfo.getOtherParam().put("_requestOrigin", getLinkPrefix(request));
         LinkInfoResp build = LinkInfoResp.builder()
-                .downLink(getDownLink(parserCreate, false) + authSuffix)
-                .apiLink(getDownLink(parserCreate, true) + authSuffix)
-                .viewLink(getViewLink(parserCreate) + authSuffix)
+                .downLink(getDownLink(parserCreate, false, request) + authSuffix)
+                .apiLink(getDownLink(parserCreate, true, request) + authSuffix)
+                .viewLink(getViewLink(parserCreate, request) + authSuffix)
                 .shareLinkInfo(shareLinkInfo).build();
         // 解析次数统计
         shareLinkInfo.getOtherParam().put("UA",request.headers().get("user-agent"));
@@ -76,25 +124,23 @@ public class ParserApi {
             }
             promise.complete(build);
         }).onFailure(t->{
-            t.printStackTrace();
+            log.error("获取统计信息失败", t);
             promise.complete(build);
         });
         return promise.future();
     }
 
-    private static String getDownLink(ParserCreate create, boolean isJson) {
-
-        String linkPrefix = SharedDataUtil.getJsonConfig("server").getString("domainName");
+    private static String getDownLink(ParserCreate create, boolean isJson, HttpServerRequest request) {
+        String linkPrefix = getLinkPrefix(request);
         if (StringUtils.isBlank(linkPrefix)) {
-            linkPrefix = "http://127.0.0.1";
+            linkPrefix = "http://127.0.0.1:" + SharedDataUtil.getJsonConfig("server").getInteger("port", 6400);
         }
         // 下载短链前缀 /d
         return linkPrefix + (isJson ? "/json/" : "/d/") + create.genPathSuffix();
     }
 
-    private static String getViewLink(ParserCreate create) {
-
-        String linkPrefix = SharedDataUtil.getJsonStringForServerConfig("domainName");
+    private static String getViewLink(ParserCreate create, HttpServerRequest request) {
+        String linkPrefix = getLinkPrefix(request);
         if (StringUtils.isBlank(linkPrefix)) {
             return "";
         }
@@ -116,23 +162,47 @@ public class ParserApi {
     }
 
     @RouteMapping("/getFileList")
-    public Future<List<FileInfo>> getFileList(HttpServerRequest request, String pwd, String dirId, String uuid) {
+    public Future<List<FileInfo>> getFileList(HttpServerRequest request, String pwd, String dirId, String uuid,
+                                             String stoken, String zml, String auth) {
         String url = URLParamUtil.parserParams(request);
-        ParserCreate parserCreate = ParserCreate.fromShareUrl(url).setShareLinkInfoPwd(pwd);
-        String linkPrefix = SharedDataUtil.getJsonConfig("server").getString("domainName");
+        ParserCreate parserCreate;
+        try {
+            parserCreate = ParserCreate.fromShareUrl(url).setShareLinkInfoPwd(pwd);
+        } catch (Exception e) {
+            return Future.failedFuture(e);
+        }
+        String linkPrefix = getLinkPrefix(request);
+        JsonObject otherParam = ParserAuthUtil.buildOtherParam(request, auth, linkPrefix);
         parserCreate.getShareLinkInfo().getOtherParam().put("domainName", linkPrefix);
+        parserCreate.getShareLinkInfo().getOtherParam().put("_requestOrigin", linkPrefix);
         if (StringUtils.isNotBlank(dirId)) {
             parserCreate.getShareLinkInfo().getOtherParam().put("dirId", dirId);
+        }
+        if (StringUtils.isNotBlank(stoken)) {
+            parserCreate.getShareLinkInfo().getOtherParam().put("stoken", stoken);
         }
         if (StringUtils.isNotBlank(uuid)) {
             parserCreate.getShareLinkInfo().getOtherParam().put("uuid", uuid);
         }
-        return parserCreate.createTool().parseFileList();
+        if (StringUtils.isNotBlank(zml)) {
+            parserCreate.getShareLinkInfo().getOtherParam().put("zml", zml);
+        }
+        return ParserAuthUtil.applyAuthParamsAndDonatedFallback(parserCreate, otherParam, dbService)
+                .compose(v -> {
+                    URLParamUtil.addParam(parserCreate);
+                    IPanTool tool = parserCreate.createTool();
+                    return IPanTool.closeAfter(tool, tool::parseFileList)
+                            .onFailure(t -> {
+                                ParserAuthUtil.recordDonatedAccountFailureIfNeeded(dbService, otherParam, t);
+                                ParserAuthUtil.recordAutoDonatedFailureIfNeeded(dbService,
+                                        parserCreate.getShareLinkInfo(), t);
+                            });
+                });
     }
 
     // 目录解析下载文件
     // @RouteMapping("/getFileDownUrl/:type/:param")
-    public Future<String> getFileDownUrl(String type, String param) {
+    public Future<String> getFileDownUrl(HttpServerRequest request, String type, String param, String auth) {
         ParserCreate parserCreate = ParserCreate.fromType(type).shareKey("-") // shareKey not null
                 .setShareLinkInfoPwd("-");
 
@@ -142,24 +212,171 @@ public class ParserApi {
             return promise.future();
         }
 
-        String paramStr = new String(Base64.getDecoder().decode(param));
+        final String paramStr;
+        try {
+            paramStr = CommonUtils.urlBase64Decode(param);
+        } catch (Exception e) {
+            Promise<String> promise = Promise.promise();
+            promise.fail("下载参数解码失败: " + e.getMessage());
+            return promise.future();
+        }
         ShareLinkInfo shareLinkInfo = parserCreate.getShareLinkInfo();
         shareLinkInfo.getOtherParam().put("paramJson", new JsonObject(paramStr));
 
         // domainName
-        String linkPrefix = SharedDataUtil.getJsonConfig("server").getString("domainName");
+        String linkPrefix = getLinkPrefix(request);
+        JsonObject otherParam = ParserAuthUtil.buildOtherParam(request, auth, linkPrefix, true);
         shareLinkInfo.getOtherParam().put("domainName", linkPrefix);
-        return parserCreate.createTool().parseById();
+        shareLinkInfo.getOtherParam().put("_requestOrigin", linkPrefix);
+        return ParserAuthUtil.applyAuthParamsAndDonatedFallback(parserCreate, otherParam, dbService)
+                .compose(v -> {
+                    URLParamUtil.addParam(parserCreate);
+                    IPanTool tool = parserCreate.createTool();
+                    return IPanTool.closeAfter(tool, tool::parseById)
+                            .onFailure(t -> {
+                                ParserAuthUtil.recordDonatedAccountFailureIfNeeded(dbService, otherParam, t);
+                                ParserAuthUtil.recordAutoDonatedFailureIfNeeded(dbService,
+                                        parserCreate.getShareLinkInfo(), t);
+                            });
+                });
     }
 
     @RouteMapping("/redirectUrl/:type/:param")
-    public Future<Void> redirectUrl(HttpServerResponse response, String type, String param) {
+    public Future<Void> redirectUrl(HttpServerRequest request, HttpServerResponse response, String type, String param,
+                                    String auth) {
         Promise<Void> promise = Promise.promise();
 
-        getFileDownUrl(type, param)
-                .onSuccess(res -> ResponseUtil.redirect(response, res))
-                .onFailure(t -> promise.fail(t.fillInStackTrace()));
+        getFileDownUrl(request, type, param, auth)
+                .onSuccess(res -> {
+                    ResponseUtil.redirect(response, res, promise);
+                })
+                .onFailure(promise::tryFail);
         return promise.future();
+    }
+
+    /**
+     * 目录文件下载信息（供前端下载器使用）：返回直链、请求头及命令行
+     */
+    @RouteMapping("/getFileDownInfo/:type/:param")
+    public Future<JsonObject> getFileDownInfo(HttpServerRequest request, String type, String param, String auth) {
+        ParserCreate parserCreate;
+        try {
+            parserCreate = ParserCreate.fromType(type).shareKey("-").setShareLinkInfoPwd("-");
+        } catch (Exception e) {
+            return Future.failedFuture(e);
+        }
+
+        if (param == null || param.isEmpty()) {
+            return Future.failedFuture("下载参数为空");
+        }
+
+        final JsonObject paramJson;
+        try {
+            paramJson = new JsonObject(CommonUtils.urlBase64Decode(param));
+        } catch (Exception e) {
+            return Future.failedFuture("下载参数解码失败: " + e.getMessage());
+        }
+
+        ShareLinkInfo shareLinkInfo = parserCreate.getShareLinkInfo();
+        shareLinkInfo.getOtherParam().put("paramJson", paramJson);
+
+        String linkPrefix = getLinkPrefix(request);
+        JsonObject otherParam = ParserAuthUtil.buildOtherParam(request, auth, linkPrefix);
+        shareLinkInfo.getOtherParam().put("domainName", linkPrefix);
+        shareLinkInfo.getOtherParam().put("_requestOrigin", linkPrefix);
+
+        return ParserAuthUtil.applyAuthParamsAndDonatedFallback(parserCreate, otherParam, dbService)
+                .compose(v -> {
+                    URLParamUtil.addParam(parserCreate);
+                    IPanTool tool = parserCreate.createTool();
+                    return IPanTool.closeAfter(tool, tool::parseById)
+                            .onFailure(t -> {
+                                ParserAuthUtil.recordDonatedAccountFailureIfNeeded(dbService, otherParam, t);
+                                ParserAuthUtil.recordAutoDonatedFailureIfNeeded(dbService,
+                                        parserCreate.getShareLinkInfo(), t);
+                            })
+                            .map(downloadUrl -> buildFileDownInfo(shareLinkInfo, paramJson, downloadUrl));
+                });
+    }
+
+    @SuppressWarnings("unchecked")
+    private static JsonObject buildFileDownInfo(ShareLinkInfo shareLinkInfo, JsonObject paramJson, String downloadUrl) {
+        Map<String, String> downloadHeaders = new HashMap<>();
+        // 入口参数里可能已带 cookie（目录解析时写入），先作为底稿
+        mergeDownloadHeaders(downloadHeaders, paramJson.getJsonObject("downloadHeaders"));
+        // 解析器运行时生成的请求头优先覆盖（如刷新后的 cookie），但跳过 null
+        Object headersObj = shareLinkInfo.getOtherParam().get("downloadHeaders");
+        if (headersObj instanceof Map) {
+            mergeDownloadHeaders(downloadHeaders, (Map<?, ?>) headersObj);
+        }
+
+        String fileName = paramJson.getString("fileName", "");
+        if (StringUtils.isBlank(fileName)) {
+            Object fn = shareLinkInfo.getOtherParam().get("fileName");
+            if (fn != null) {
+                fileName = fn.toString();
+            }
+        }
+
+        boolean needDownloader = Boolean.TRUE.equals(paramJson.getBoolean("needDownloader"))
+                || !downloadHeaders.isEmpty();
+
+        shareLinkInfo.getOtherParam().put("downloadUrl", downloadUrl);
+        if (!downloadHeaders.isEmpty()) {
+            shareLinkInfo.getOtherParam().put("downloadHeaders", downloadHeaders);
+        }
+
+        JsonObject result = new JsonObject()
+                .put("downloadUrl", downloadUrl)
+                .put("fileName", fileName)
+                .put("needDownloader", needDownloader)
+                .put("downloadHeaders", downloadHeaders);
+
+        try {
+            Map<ClientLinkType, String> clientLinks = ClientLinkGeneratorFactory.generateAll(shareLinkInfo);
+            if (clientLinks.containsKey(ClientLinkType.CURL)) {
+                result.put("curlCommand", clientLinks.get(ClientLinkType.CURL));
+            }
+            if (clientLinks.containsKey(ClientLinkType.ARIA2)) {
+                result.put("aria2Command", clientLinks.get(ClientLinkType.ARIA2));
+            }
+            if (clientLinks.containsKey(ClientLinkType.THUNDER)) {
+                result.put("thunderLink", clientLinks.get(ClientLinkType.THUNDER));
+            }
+        } catch (Exception e) {
+            log.warn("生成下载命令失败: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * 合并下载请求头，忽略 null/空值，避免运行时 null 覆盖入口参数中的 cookie。
+     */
+    private static void mergeDownloadHeaders(Map<String, String> target, JsonObject source) {
+        if (source == null || source.isEmpty()) {
+            return;
+        }
+        for (String key : source.fieldNames()) {
+            Object val = source.getValue(key);
+            if (val != null && StringUtils.isNotBlank(val.toString())) {
+                target.put(key, val.toString());
+            }
+        }
+    }
+
+    private static void mergeDownloadHeaders(Map<String, String> target, Map<?, ?> source) {
+        if (source == null || source.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<?, ?> e : source.entrySet()) {
+            if (e.getKey() == null || e.getValue() == null) {
+                continue;
+            }
+            String val = e.getValue().toString();
+            if (StringUtils.isNotBlank(val)) {
+                target.put(e.getKey().toString(), val);
+            }
+        }
     }
 
 
@@ -184,7 +401,7 @@ public class ParserApi {
         }
         
         String previewURL = SharedDataUtil.getJsonStringForServerConfig("previewURL");
-        serverApi.parseKeyJson(request, type, key).onSuccess(res -> {
+        serverApi.parseKeyJsonForRedirect(request, type, key).onSuccess(res -> {
             redirect(response, previewURL, res);
         }).onFailure(e -> {
             ResponseUtil.fireJsonResultResponse(response, JsonResult.error(e.toString()));
@@ -220,7 +437,7 @@ public class ParserApi {
         }
         
         String previewURL = SharedDataUtil.getJsonStringForServerConfig("previewURL");
-        new ServerApi().parseJson(request, pwd, null).onSuccess(res -> {
+        serverApi.parseJsonForRedirect(request, pwd, null).onSuccess(res -> {
             redirect(response, previewURL, res);
         }).onFailure(e -> {
             ResponseUtil.fireJsonResultResponse(response, JsonResult.error(e.toString()));
@@ -229,27 +446,31 @@ public class ParserApi {
 
 
     @RouteMapping("/viewUrl/:type/:param")
-    public Future<Void> viewUrl(HttpServerResponse response, String type, String param) {
+    public Future<Void> viewUrl(HttpServerRequest request, HttpServerResponse response, String type, String param,
+                                String auth) {
         Promise<Void> promise = Promise.promise();
 
         String viewPrefix = SharedDataUtil.getJsonConfig("server").getString("previewURL");
-        getFileDownUrl(type, param)
+        getFileDownUrl(request, type, param, auth)
                 .onSuccess(res -> {
                     String url = viewPrefix + URLEncoder.encode(res, StandardCharsets.UTF_8);
-                    ResponseUtil.redirect(response, url);
+                    ResponseUtil.redirect(response, url, promise);
                 })
-                .onFailure(t -> promise.fail(t.fillInStackTrace()));
+                .onFailure(promise::tryFail);
         return promise.future();
     }
 
     // 获取版本号
     @RouteMapping("/build-version")
     public String getVersion() {
-        return CommonUtil.getAppVersion()
+        String version = CommonUtil.getAppVersion();
+        if (version == null || version.isBlank()) {
+            return "unknown";
+        }
+        return version
         .replace("-", "")
         .replace("Z", "")
         .replace("T", "_")
-        .replace("-", "")
         .replace(":", "");
     }
 
@@ -269,7 +490,8 @@ public class ParserApi {
             String shareUrl = URLParamUtil.parserParams(request);
             ParserCreate parserCreate = ParserCreate.fromShareUrl(shareUrl).setShareLinkInfoPwd(pwd);
             ShareLinkInfo shareLinkInfo = parserCreate.getShareLinkInfo();
-            
+            shareLinkInfo.getOtherParam().put("_requestOrigin", getLinkPrefix(request));
+
             // 处理认证参数
             if (auth != null && !auth.isEmpty()) {
                 AuthParam authParam = AuthParamCodec.decode(auth);
@@ -285,10 +507,13 @@ public class ParserApi {
                         authParam.getExt5());
                     log.debug("客户端链接API: 已解码认证参数 authType={}", authParam.getAuthType());
                 }
+            } else {
+                URLParamUtil.addParam(parserCreate);
             }
             
             // 使用默认方法解析并生成客户端链接
-            parserCreate.createTool().parseWithClientLinks()
+            IPanTool tool = parserCreate.createTool();
+            IPanTool.closeAfter(tool, tool::parseWithClientLinks)
                 .onSuccess(clientLinks -> {
                     try {
                         ClientLinkResp response = buildClientLinkResponse(shareLinkInfo, clientLinks);
@@ -326,9 +551,12 @@ public class ParserApi {
         try {
             String shareUrl = URLParamUtil.parserParams(request);
             ParserCreate parserCreate = ParserCreate.fromShareUrl(shareUrl).setShareLinkInfoPwd(pwd);
-            
+            parserCreate.getShareLinkInfo().getOtherParam().put("_requestOrigin", getLinkPrefix(request));
+            URLParamUtil.addParam(parserCreate);
+
             // 使用默认方法解析并生成客户端链接
-            parserCreate.createTool().parseWithClientLinks()
+            IPanTool tool = parserCreate.createTool();
+            IPanTool.closeAfter(tool, tool::parseWithClientLinks)
                 .onSuccess(clientLinks -> {
                     try {
                         String clientLink = extractClientLinkByType(clientLinks, clientType);

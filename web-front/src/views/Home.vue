@@ -19,11 +19,11 @@
     </el-dialog> -->
     <!-- 顶部反馈栏（小号、灰色、无红边框） -->
     <div class="feedback-bar">
-      <a href="https://github.com/qaiu/netdisk-fast-download/issues" target="_blank" rel="noopener" class="feedback-link mini">
+      <a :href="githubRepoUrl + '/issues'" target="_blank" rel="noopener" class="feedback-link mini">
         <i class="fas fa-bug feedback-icon"></i>
         反馈
       </a>
-      <a href="https://github.com/qaiu/netdisk-fast-download" target="_blank" rel="noopener" class="feedback-link mini">
+      <a :href="githubRepoUrl" target="_blank" rel="noopener" class="feedback-link mini">
         <i class="fab fa-github feedback-icon"></i>
         源码
       </a>
@@ -73,9 +73,9 @@
         </div>
         <!-- 项目简介移到卡片内 -->
         <div class="project-intro">
-          <div class="intro-title">NFD网盘直链解析0.3.0</div>
+          <div class="intro-title">NFD网盘直链解析 {{ projectVersion }}</div>
           <div class="intro-desc">
-            <div>支持网盘：蓝奏云、蓝奏云优享、小飞机盘、123云盘、iCloud、移动云空间、联想乐云、QQ闪传等 <el-link style="color:#606cf5" href="https://github.com/qaiu/netdisk-fast-download?tab=readme-ov-file#%E7%BD%91%E7%9B%98%E6%94%AF%E6%8C%81%E6%83%85%E5%86%B5" target="_blank"> &gt;&gt; </el-link></div>
+            <div>支持网盘：蓝奏云、蓝奏云优享、小飞机盘、123云盘、iCloud、移动云空间、联想乐云、QQ闪传等 <el-link style="color:#606cf5" :href="githubRepoUrl + '?tab=readme-ov-file#%E7%BD%91%E7%9B%98%E6%94%AF%E6%8C%81%E6%83%85%E5%86%B5'" target="_blank"> &gt;&gt; </el-link></div>
             <div>文件夹解析支持：蓝奏云、蓝奏云优享、小飞机盘、123云盘</div>
           </div>
         </div>
@@ -90,7 +90,7 @@
             <!-- 开关按钮，控制是否自动读取剪切板 -->
             <el-switch v-model="autoReadClipboard" active-text="自动识别剪切板"></el-switch>
 
-            <el-input placeholder="请粘贴分享链接(http://或https://)" v-model="link" id="url">
+            <el-input placeholder="请粘贴分享链接(http://或https://)" v-model="link" id="url" @paste="onPaste" @blur="normalizeShortcutInput">
               <template #prepend>分享链接</template>
               <template #append v-if="!autoReadClipboard">
                 <el-button @click="getPaste(true)">读取剪切板</el-button>
@@ -131,10 +131,15 @@
                   <div style="display: flex; align-items: center; justify-content: space-between;">
                     <span>下载链接</span>
                     <div style="display: flex; gap: 8px;">
-                      <el-button @click="openUrl(downloadUrl)" type="primary" size="small">
-                        <el-icon style="margin-right: 4px;"><Download /></el-icon> 下载
-                      </el-button>
-                      <el-button @click="openUrl(getPreviewLink())" type="default" size="small">
+                      <el-tooltip :disabled="!needsDownloader"
+                        content="该网盘需使用下载器下载" placement="top">
+                        <el-button @click="openUrl(downloadUrl)" type="primary" size="small"
+                          :disabled="needsDownloader">
+                          <el-icon style="margin-right: 4px;"><Download /></el-icon> 下载
+                        </el-button>
+                      </el-tooltip>
+                      <el-button @click="openUrl(getPreviewLink())" type="default" size="small"
+                        :disabled="needsDownloader">
                         <el-icon style="margin-right: 4px;"><View /></el-icon> 预览
                       </el-button>
                       <el-tooltip :disabled="aria2Connected"
@@ -150,10 +155,14 @@
                 </template>
                 <el-input :value="downloadUrl" readonly>
                   <template #append>
-                    <el-button v-clipboard:copy="downloadUrl" v-clipboard:success="onCopy"
-                      v-clipboard:error="onError" style="padding: 0 14px;">
-                      <el-icon><CopyDocument/></el-icon>
-                    </el-button>
+                    <el-tooltip :disabled="!needsDownloader"
+                      content="该网盘需使用下载器，无法直接复制直链" placement="top">
+                      <el-button v-clipboard:copy="downloadUrl" v-clipboard:success="onCopy"
+                        v-clipboard:error="onError" style="padding: 0 14px;"
+                        :disabled="needsDownloader">
+                        <el-icon><CopyDocument/></el-icon>
+                      </el-button>
+                    </el-tooltip>
                   </template>
                 </el-input>
                 <!-- 文件元信息 -->
@@ -257,28 +266,44 @@
             </el-descriptions>
           </div>
 
-          <!-- 错误时显示小按钮 -->
-          <div v-if="errorButtonVisible" style="text-align: center; margin-top: 10px;">
-            <el-button type="text" @click="errorDialogVisible = true"> 反馈错误详情>> </el-button>
-          </div>
+          <!-- 错误徽章，解析失败时显示，可手动关闭，解析成功自动关闭 -->
+          <transition name="el-fade-in">
+            <div v-if="errorBadgeVisible"
+              style="position:fixed;z-index:9999;top:80px;right:24px;display:flex;align-items:center;background:#fff1f0;border:1px solid #ffccc7;border-radius:16px;padding:6px 8px 6px 14px;box-shadow:0 2px 10px rgba(217,48,38,.12);cursor:pointer;"
+              @click.self="errorDialogVisible=true">
+              <i class="fas fa-exclamation-circle" style="color:#d93026;font-size:15px;margin-right:7px;pointer-events:none;"></i>
+              <span style="font-size:14px;color:#d93026;margin-right:8px;pointer-events:none;" @click="errorDialogVisible=true">解析出错</span>
+              <el-button
+                size="small" circle
+                style="width:20px;height:20px;min-height:20px;padding:0;background:transparent;border:none;color:#d93026;"
+                @click.stop="errorBadgeVisible=false">
+                <i class="el-icon-close" style="font-size:12px;"></i>
+              </el-button>
+            </div>
+          </transition>
 
-          <!-- 错误 JSON 弹窗 -->
-          <el-dialog
-              v-model="errorDialogVisible"
-              width="60%">
+          <!-- 错误弹窗 -->
+          <el-dialog v-model="errorDialogVisible" width="500px" :show-close="true" @close="errorMsgExpanded=false">
             <template #title>
-              错误详情
-              <el-link
-                  @click.prevent="copyErrorDetails"
-                  target="_blank"
-                  style="margin-left:8px"
-                  type="primary">
-                复制当前错误信息，提交Issue
-              </el-link>
+              <i class="fas fa-exclamation-circle" style="color:#d93026;margin-right:8px;"></i>
+              <span style="color:#d93026;font-weight:600;">解析出错</span>
             </template>
-            <json-viewer :value="errorDetail" :expand-depth="5" copyable boxed sort />
+            <div style="font-size:13px;color:#606266;margin-bottom:12px;word-break:break-all;line-height:1.6;">
+              <template v-if="errorDetail">
+                <span>{{ errorMsgExpanded ? (errorDetail.msg || errorDetail.message) : truncateMsg(errorDetail.msg || errorDetail.message) }}</span>
+                <a v-if="!errorMsgExpanded && (errorDetail.msg || errorDetail.message || '').length > 150"
+                   href="#" style="color:#1677ff;margin-left:4px;"
+                   @click.prevent="errorMsgExpanded=true">展开</a>
+                <a v-if="errorMsgExpanded"
+                   href="#" style="color:#1677ff;margin-left:4px;"
+                   @click.prevent="errorMsgExpanded=false">收起</a>
+              </template>
+            </div>
             <template #footer>
               <el-button @click="errorDialogVisible = false">关闭</el-button>
+              <el-button type="danger" plain @click="copyErrorDetails">
+                <i class="fab fa-github" style="margin-right:6px;"></i>复制信息并前往 GitHub Issues
+              </el-button>
             </template>
           </el-dialog>
 
@@ -309,6 +334,10 @@
                     <el-option label="蓝奏优享 (IZ)" value="IZ">
                       <span>蓝奏优享 (IZ)</span>
                       <el-tag size="small" type="warning" style="margin-left: 8px">大文件</el-tag>
+                    </el-option>
+                    <el-option label="123云盘 (YE)" value="YE">
+                      <span>123云盘 (YE)</span>
+                      <el-tag size="small" type="warning" style="margin-left: 8px">部分分享需登录</el-tag>
                     </el-option>
                   </el-option-group>
                 </el-select>
@@ -397,6 +426,7 @@
               :file-list="directoryData" 
               :share-url="link"
               :password="password"
+              :auth="directoryAuth"
               :view-mode="directoryViewMode"
               @file-click="handleFileClick"
             />
@@ -595,11 +625,10 @@ import fileTypeUtils from '@/utils/fileTypeUtils'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { playgroundApi } from '@/utils/playgroundApi'
 import { testConnection, autoDetect, addDownload, getConfig, saveConfig } from '@/utils/downloaderService'
-
-export const previewBaseUrl = 'https://nfd-parser.github.io/nfd-preview/preview.html?src=';
+import { PREVIEW_BASE_URL } from '@/utils/constants'
 
 export default {
-  name: 'App',
+  name: 'Home',
   components: { DarkMode, DirectoryTree, DownloadDialog },
   mixins: [fileTypeUtils],
   data() {
@@ -608,7 +637,9 @@ export default {
       autoReadClipboard: true,
       isDarkMode: false,
       isLoading: false,
-      
+      errorBadgeVisible: false,
+      errorMsgExpanded: false,
+
       // 输入数据
       link: "",
       password: "",
@@ -617,7 +648,7 @@ export default {
       parseResult: {},
       downloadUrl: null,
       directLink: '',
-      previewBaseUrl,
+      previewBaseUrl: PREVIEW_BASE_URL,
       
       // 功能结果
       markdownText: '',
@@ -628,6 +659,7 @@ export default {
       // 目录树
       showDirectoryTree: false,
       directoryData: [],
+      directoryAuth: '', // 目录解析时的加密 auth，透传给子目录/下载
       
       // 统计信息
       node1Info: {},
@@ -714,6 +746,12 @@ export default {
     }
   },
   computed: {
+    githubRepoUrl() {
+      return process.env.VUE_APP_GITHUB_REPO_URL
+    },
+    projectVersion() {
+      return process.env.VUE_APP_VERSION || '0.0.0'
+    },
     // 检查是否配置了认证信息（针对当前链接的网盘类型）
     hasAuthConfig() {
       const panType = this.getCurrentPanType()
@@ -733,6 +771,16 @@ export default {
         thunder: '迅雷'
       }
       return map[this.aria2ConfigForm.downloaderType] || 'Aria2'
+    },
+    // 需要下载器（带 cookie 等特殊头）时禁用浏览器下载/复制直链；UC/夸克始终需要
+    needsDownloader() {
+      const pan = (this.getCurrentPanType() || '').toLowerCase()
+      if (pan === 'uc' || pan === 'qk') return true
+      const data = this.parseResult?.data
+      if (!data) return false
+      if (data.needDownloader || data.otherParam?.needDownloader) return true
+      const headers = data.downloadHeaders || data.otherParam?.downloadHeaders
+      return !!(headers && (headers.cookie || headers.Cookie))
     }
   },
   methods: {
@@ -744,7 +792,8 @@ export default {
       if (url.includes('drive.uc.cn') || url.includes('fast.uc.cn')) return 'UC'
       if (url.includes('feijipan.com') || url.includes('feijihe.com') || url.includes('xiaofeiyang.com')) return 'FJ'
       if (url.includes('ilanzou.com') || url.includes('lanzouv.com')) return 'IZ'
-      if (url.includes('123pan.com') || url.includes('123684.com') || url.includes('123865.com')) return 'YE'
+      // 123网盘域名较多（如 123pan.com/123pan.cn/share.123pan.cn/123684.com/123865.com 等数字域名），使用规则匹配代替枚举
+      if (/123\d{3}\.com|123panpay\.com|123pan\.(?:com|cn)/.test(url)) return 'YE'
       return ''
     },
     
@@ -766,7 +815,8 @@ export default {
         'QK': '夸克网盘必须配置 Cookie 才能解析和下载（登录后从浏览器开发者工具获取）',
         'UC': 'UC网盘必须配置 Cookie 才能解析和下载（登录后从浏览器开发者工具获取）',
         'FJ': '小飞机网盘大文件（>100MB）需要配置认证信息',
-        'IZ': '蓝奏优享大文件需要配置认证信息'
+        'IZ': '蓝奏优享大文件需要配置认证信息',
+        'YE': '123云盘部分分享（需要登录才能查看/下载）需要配置账号密码或 Authorization Token'
       }
       return hints[this.authConfig.panType] || '请选择网盘类型后配置认证信息'
     },
@@ -959,18 +1009,16 @@ export default {
       // 优先使用个人配置
       if (this.allAuthConfigs[panType]) {
         config = this.allAuthConfigs[panType]
-        console.log(`[认证] 使用个人配置: ${this.getPanDisplayName(panType)}`)
       } else {
         // 从后端随机获取捐赠账号（后端已加密，直接使用 encryptedAuth）
         try {
           const response = await axios.get(`${this.baseAPI}/v2/randomAuth`, { params: { panType } })
           const encryptedAuth = response.data?.data?.encryptedAuth
           if (encryptedAuth) {
-            console.log(`[认证] 使用捐赠账号: ${this.getPanDisplayName(panType)}`)
             return encryptedAuth
           }
         } catch (e) {
-          console.log(`[认证] 无可用捐赠账号: ${this.getPanDisplayName(panType)}`)
+          // no available donated account
         }
         return ''
       }
@@ -1091,17 +1139,59 @@ export default {
       }
     },
 
-    // 识别并转换短链输入（如 lz:shareKey@pwd）
+    // 识别并转换短链输入（如 lz:shareKey@pwd），或从文本中提取链接
     normalizeShortcutInput() {
-      const shortInfo = this.expandShortFormat(this.link)
-      if (!shortInfo) return
-
-      this.link = shortInfo.link
-      if (!this.password && shortInfo.pwd) {
-        this.password = shortInfo.pwd
+      if (!this.link) return
+      const trimmed = this.link.trim()
+      if (!trimmed) {
+        this.link = ''
+        return
       }
-      this.$message.success(`已识别短格式并自动转换，网盘类型: ${shortInfo.name}`)
-      this.updateDirectLink()
+      this.link = trimmed
+
+      // 已经是直接链接：仍尝试从整段文本中抽出标准分享地址
+      if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+        const linkInfo = parserUrl.parseLink(trimmed)
+        if (linkInfo.link) {
+          this.link = linkInfo.link
+          const pwd = parserUrl.parsePwd(trimmed)
+          if (!this.password && pwd) {
+            this.password = pwd
+          }
+        }
+        return
+      }
+
+      // 尝试短格式
+      const shortInfo = this.expandShortFormat(trimmed)
+      if (shortInfo) {
+        this.link = shortInfo.link
+        if (!this.password && shortInfo.pwd) {
+          this.password = shortInfo.pwd
+        }
+        this.$message.success(`已识别短格式并自动转换，网盘类型: ${shortInfo.name}`)
+        this.updateDirectLink()
+        return
+      }
+
+      // 从文本中自动提取链接
+      const linkInfo = parserUrl.parseLink(trimmed)
+      if (linkInfo.link) {
+        this.link = linkInfo.link
+        const pwd = parserUrl.parsePwd(trimmed)
+        if (!this.password && pwd) {
+          this.password = pwd
+        }
+        this.$message.success(`已从文本中识别到 ${linkInfo.name} 分享链接`)
+        this.updateDirectLink()
+      }
+    },
+
+    // 粘贴事件：从粘贴的文本中自动提取链接
+    onPaste(e) {
+      this.$nextTick(() => {
+        this.normalizeShortcutInput()
+      })
     },
 
     // 清除结果
@@ -1113,30 +1203,48 @@ export default {
       this.statisticsData = {}
       this.showDirectoryTree = false
       this.directoryData = []
+      this.directoryAuth = ''
     },
 
     // 统一API调用（自动添加认证参数）
     async callAPI(endpoint, params = {}) {
       this.errorButtonVisible = false
+      this.errorBadgeVisible = false
       try {
         this.isLoading = true
-        // 添加认证参数（异步获取）
-        const authParam = await this.generateAuthParam()
-        if (authParam) {
-          params.auth = authParam
+        // 添加认证参数（已有则不覆盖，便于目录树透传同一份 auth）
+        if (!params.auth) {
+          const authParam = await this.generateAuthParam()
+          if (authParam) {
+            params.auth = authParam
+          }
         }
         const response = await axios.get(`${this.baseAPI}${endpoint}`, { params })
-        
+
         if (response.data.code === 200) {
           // this.$message.success(response.data.msg || '操作成功')
+          this.errorBadgeVisible = false
           return response.data
         } else {
-          // 在页面右下角显示一个“查看详情”按钮 可以查看原json
+          // 解析失败，显示徽章和弹窗
           this.errorDetail = response?.data
           this.errorButtonVisible = true
+          this.errorBadgeVisible = true
+          this.errorDialogVisible = true
           throw new Error(response.data.msg || '操作失败')
         }
       } catch (error) {
+        // HTTP 非2xx时，从响应体中提取后端返回的错误信息
+        if (error.response?.data?.msg) {
+          this.errorDetail = error.response.data
+          this.errorButtonVisible = true
+          this.errorBadgeVisible = true
+          this.errorDialogVisible = true
+          this.$message.error(error.response.data.msg)
+          throw new Error(error.response.data.msg)
+        }
+        this.errorBadgeVisible = true
+        this.errorDialogVisible = true
         this.$message.error(error.message || '网络错误')
         throw error
       } finally {
@@ -1166,10 +1274,11 @@ export default {
             duration: 5000,
             showClose: true
           })
-        } else if (panType === 'fj' || panType === 'lz' || panType === 'iz' || panType === 'le') {
-          // 小飞机、蓝奏、优享、联想乐云：提示大文件需要认证
+        } else if (panType === 'fj' || panType === 'lz' || panType === 'iz' || panType === 'le' || panType === 'ye') {
+          // 小飞机、蓝奏、优享、联想乐云、123云盘：提示大文件/需登录分享需要认证
           const hasAuth = this.allAuthConfigs[panType]?.cookie || 
                           this.allAuthConfigs[panType]?.username ||
+                          this.allAuthConfigs[panType]?.token ||
                           (this.donateAccountCounts.active[panType.toUpperCase()] || 0) > 0
           if (!hasAuth) {
             this.$message.info({
@@ -1196,11 +1305,13 @@ export default {
         // 更新智能直链（包含认证参数）
         this.updateDirectLink()
         // 如果需要下载器（含特殊头），弹出下载器对话框
-        if (result.data?.needDownloader) {
+        const needDownloader = !!(result.data?.needDownloader || otherParam.needDownloader
+          || otherParam.downloadHeaders?.cookie || otherParam.downloadHeaders?.Cookie)
+        if (needDownloader) {
           this.downloadDialogInfo = {
             downloadUrl: result.data.directLink,
-            fileName: result.data.fileName || '',
-            downloadHeaders: result.data.downloadHeaders || {},
+            fileName: result.data.fileInfo?.fileName || result.data.fileName || '',
+            downloadHeaders: result.data.downloadHeaders || otherParam.downloadHeaders || {},
             aria2Command: this.aria2Command,
             curlCommand: this.curlCommand,
             aria2JsonRpc: this.aria2JsonRpc,
@@ -1220,6 +1331,11 @@ export default {
         this.validateInput()
         const params = { url: this.link }
         if (this.password) params.pwd = this.password
+        // 预先生成 auth，既给本次请求用，也透传给 DirectoryTree 子目录/下载
+        this.directoryAuth = await this.generateAuthParam()
+        if (this.directoryAuth) {
+          params.auth = this.directoryAuth
+        }
         
         // 直接调用 getFileList，让后端返回错误（不做客户端类型检查）
         const directoryResult = await this.callAPI('/v2/getFileList', params)
@@ -1309,7 +1425,7 @@ export default {
     // 文件点击处理
     handleFileClick(file) {
       if (file.parserUrl) {
-        window.open(file.parserUrl, '_blank')
+        window.open(file.parserUrl, '_blank', 'noopener,noreferrer')
       } else {
         this.$message.warning('该文件暂无下载链接')
       }
@@ -1318,8 +1434,7 @@ export default {
     // 获取剪切板内容
     async getPaste(isManual = false) {
       try {
-        const text = await navigator.clipboard.readText()
-        console.log('获取到的文本内容是：', text)
+        const text = (await navigator.clipboard.readText() || '').trim()
 
         const shortInfo = this.expandShortFormat(text)
         if (shortInfo) {
@@ -1364,7 +1479,9 @@ export default {
         }
       } catch (error) {
         console.error('读取剪切板失败:', error)
-        this.$message.error('读取剪切板失败，请检查浏览器权限')
+        if (isManual) {
+          this.$message.warning('读取剪切板失败，请手动粘贴链接到输入框')
+        }
       }
     },
 
@@ -1433,13 +1550,18 @@ export default {
       })
     },
 
+    truncateMsg(msg) {
+      if (!msg) return ''
+      return msg.length > 150 ? msg.slice(0, 150) + '...' : msg
+    },
+
     copyErrorDetails() {
       const text = `分享链接：${this.link}
 分享密码：${this.password || ''}
 错误信息：${JSON.stringify(this.errorDetail, null, 2)}`;
       navigator.clipboard.writeText(text).then(() => {
         this.$message.success('已复制分享信息和错误详情');
-        window.open('https://github.com/qaiu/netdisk-fast-download/issues/new', '_blank');
+        window.open(`${this.githubRepoUrl}/issues/new`, '_blank', 'noopener,noreferrer');
       }).catch(() => {
         this.$message.error('复制失败');
       });
@@ -1542,12 +1664,14 @@ export default {
       
       this.donateSubmitting = true
       try {
+        // 只提交当前认证方式实际用到的字段，避免切换认证类型后遗留的用户名/密码脏数据被一起提交
+        const isPasswordAuth = this.donateConfig.authType === 'password'
         const payload = {
           panType: this.donateConfig.panType,
           authType: this.donateConfig.authType,
-          username: this.donateConfig.username || '',
-          password: this.donateConfig.password || '',
-          token: this.donateConfig.token || '',
+          username: isPasswordAuth ? (this.donateConfig.username || '') : '',
+          password: isPasswordAuth ? (this.donateConfig.password || '') : '',
+          token: isPasswordAuth ? '' : (this.donateConfig.token || ''),
           remark: this.donateConfig.remark || ''
         }
         await axios.post(`${this.baseAPI}/v2/donateAccount`, payload)
@@ -1786,19 +1910,26 @@ export default {
     }
 
     // 监听窗口焦点事件
-    window.addEventListener('focus', () => {
+    this._onFocusHandler = () => {
       if (this.autoReadClipboard) {
         this.hasClipboardSuccessTip = false // 聚焦时重置，只提示一次
         this.getPaste()
       }
-    })
+    }
+    window.addEventListener('focus', this._onFocusHandler)
 
     // 首次打开页面弹出风险提示
     if (!window.localStorage.getItem('nfd_risk_ack')) {
       this.showRiskDialog = true
     }
   },
-  
+
+  beforeUnmount() {
+    if (this._onFocusHandler) {
+      window.removeEventListener('focus', this._onFocusHandler)
+    }
+  },
+
   watch: {
     downloadUrl(val) {
       if (!val) {

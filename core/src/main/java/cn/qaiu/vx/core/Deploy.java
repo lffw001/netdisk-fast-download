@@ -16,9 +16,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.UUID;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.LockSupport;
 
 import static cn.qaiu.vx.core.util.ConfigConstant.*;
@@ -43,9 +47,23 @@ public final class Deploy {
     private Handler<JsonObject> handle;
 
     private Thread mainThread;
+    private final List<Runnable> preShutdownTasks = new CopyOnWriteArrayList<>();
+    private final List<Runnable> postShutdownTasks = new CopyOnWriteArrayList<>();
 
     public static Deploy instance() {
         return INSTANCE;
+    }
+
+    public void addPreShutdownTask(Runnable task) {
+        if (task != null) {
+            preShutdownTasks.add(task);
+        }
+    }
+
+    public void addPostShutdownTask(Runnable task) {
+        if (task != null) {
+            postShutdownTasks.add(task);
+        }
     }
 
     /**
@@ -62,10 +80,19 @@ public final class Deploy {
             path.append("-").append(args[0].replace("app-",""));
         }
 
-        // 读取yml配置
+        // 读取yml配置，优先当前目录，其次 resources/ 子目录
+        String configFile = path + ".yml";
+        if (!Files.exists(Path.of(configFile)) && Files.exists(Path.of("resources", configFile))) {
+            path.insert(0, "resources/");
+            LOGGER.info("从 resources/ 目录加载配置: {}", path + ".yml");
+        }
         ConfigUtil.readYamlConfig(path.toString(), tempVertx)
                 .onSuccess(this::readConf)
-                .onFailure(Throwable::printStackTrace);
+                .onFailure(err -> {
+                    LOGGER.error("读取配置文件失败: {}", err.getMessage(), err);
+                    LockSupport.unpark(mainThread);
+                    System.exit(-1);
+                });
         LockSupport.park();
         deployVerticle();
     }
@@ -122,9 +149,16 @@ public final class Deploy {
         customConfig = globalConfig.getJsonObject(CUSTOM);
 
         JsonObject vertxConfig = globalConfig.getJsonObject(VERTX);
-        Integer vertxConfigELPS = vertxConfig.getInteger(EVENT_LOOP_POOL_SIZE);
-        var vertxOptions = vertxConfigELPS == 0 ?
-                new VertxOptions() : new VertxOptions(vertxConfig);
+        JsonObject vertxOptionsConfig = vertxConfig.copy();
+        if (vertxOptionsConfig.getInteger(EVENT_LOOP_POOL_SIZE, 0) == 0) {
+            vertxOptionsConfig.remove(EVENT_LOOP_POOL_SIZE);
+        }
+        if (vertxOptionsConfig.getInteger("workerPoolSize", 0) == 0) {
+            vertxOptionsConfig.remove("workerPoolSize");
+        }
+        Integer vertxConfigELPS = vertxConfig.getInteger(EVENT_LOOP_POOL_SIZE, 0);
+        var vertxOptions = vertxOptionsConfig.isEmpty() ?
+                new VertxOptions() : new VertxOptions(vertxOptionsConfig);
 
 //        vertxOptions.setAddressResolverOptions(
 //                new AddressResolverOptions().
@@ -137,30 +171,46 @@ public final class Deploy {
                 vertxOptions.getWorkerPoolSize());
         var vertx = Vertx.vertx(vertxOptions);
         VertxHolder.init(vertx);
+
+        // 注册 ShutdownHook，确保进程退出时优雅关闭资源
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            LOGGER.info("JVM shutting down...");
+            runShutdownTasks("before Vert.x close", preShutdownTasks);
+            try {
+                LOGGER.info("Closing Vert.x...");
+                vertx.close().toCompletionStage().toCompletableFuture().get(10, java.util.concurrent.TimeUnit.SECONDS);
+                LOGGER.info("Vert.x closed successfully");
+            } catch (Exception e) {
+                LOGGER.warn("Vert.x close error or timeout", e);
+            } finally {
+                runShutdownTasks("after Vert.x close", postShutdownTasks);
+            }
+        }));
         //配置保存在共享数据中
         var sharedData = vertx.sharedData();
         LocalMap<String, Object> localMap = sharedData.getLocalMap(LOCAL);
         localMap.put(GLOBAL_CONFIG, globalConfig);
         localMap.put(CUSTOM_CONFIG, customConfig);
         localMap.put(SERVER, globalConfig.getJsonObject(SERVER));
-        var future0 = vertx.createSharedWorkerExecutor("other-handle")
-                .executeBlocking(() -> {
+        WorkerExecutor otherHandleExecutor = vertx.createSharedWorkerExecutor("other-handle");
+        var future0 = otherHandleExecutor.executeBlocking(() -> {
                     handle.handle(globalConfig);
                     return "Other handle complete";
                 });
 
         future0.onSuccess(res -> {
+            otherHandleExecutor.close();
             LOGGER.info(res);
             // 部署 路由、异步service、反向代理 服务
             var future1 = vertx.deployVerticle(RouterVerticle.class, getWorkDeploymentOptions("Router"));
             var future2 = vertx.deployVerticle(ServiceVerticle.class, getWorkDeploymentOptions("Service"));
-            var future3 = vertx.deployVerticle(ReverseProxyVerticle.class, getWorkDeploymentOptions("proxy"));
+            var future3 = vertx.deployVerticle(ReverseProxyVerticle.class, getWorkDeploymentOptions("proxy", 1));
 
 
             JsonObject jsonObject = ((JsonObject) localMap.get(GLOBAL_CONFIG)).getJsonObject("proxy-server");
             if (jsonObject != null) {
                 genPwd(jsonObject);
-                var future4 = vertx.deployVerticle(HttpProxyVerticle.class, getWorkDeploymentOptions("proxy"));
+                var future4 = vertx.deployVerticle(HttpProxyVerticle.class, getWorkDeploymentOptions("proxy", 1));
                 future4.onSuccess(LOGGER::info);
                 future4.onFailure(e -> LOGGER.error("Other handle error", e));
                 Future.all(future1, future2, future3, future4)
@@ -172,7 +222,10 @@ public final class Deploy {
                         .onFailure(this::deployVerticalFailed);
             }
 
-        }).onFailure(e -> LOGGER.error("Other handle error", e));
+        }).onFailure(e -> {
+            otherHandleExecutor.close();
+            LOGGER.error("Other handle error", e);
+        });
     }
 
     private static void genPwd(JsonObject jsonObject) {
@@ -189,6 +242,21 @@ public final class Deploy {
                 jsonObject.getString("password"));
         LOGGER.info("==============server info================");
     }
+
+    private static void runShutdownTasks(String stage, List<Runnable> tasks) {
+        if (tasks.isEmpty()) {
+            return;
+        }
+        LOGGER.info("Running {} shutdown tasks: {}", stage, tasks.size());
+        for (Runnable task : tasks) {
+            try {
+                task.run();
+            } catch (Exception e) {
+                LOGGER.warn("Shutdown task failed at stage {}", stage, e);
+            }
+        }
+    }
+
     /**
      * 部署失败
      *

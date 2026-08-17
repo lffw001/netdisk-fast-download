@@ -31,6 +31,7 @@ target/
 sdkTest.log
 app.yml
 app-local.yml
+secret.yml
 
 
 #some local files
@@ -91,3 +92,4 @@ yarn-error.log*
 **/${project.build.directory}/
 **/${project.basedir}/target/
 **/${basedir}/target/
+.spec-workflow/

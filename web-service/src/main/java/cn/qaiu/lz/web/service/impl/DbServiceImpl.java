@@ -42,12 +42,11 @@ public class DbServiceImpl implements DbService {
     @Override
     public Future<JsonObject> sayOk(String data) {
         log.info("say ok1 -> wait...");
-        try {
-            Thread.sleep(4000);
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-        return Future.succeededFuture(JsonObject.mapFrom(JsonResult.data("Hi: " + data)));
+        Promise<JsonObject> promise = Promise.promise();
+        cn.qaiu.vx.core.util.VertxHolder.getVertxInstance().setTimer(4000, id -> {
+            promise.complete(JsonObject.mapFrom(JsonResult.data("Hi: " + data)));
+        });
+        return promise.future();
     }
 
     @Override
@@ -86,37 +85,49 @@ public class DbServiceImpl implements DbService {
     public Future<JsonObject> getPlaygroundParserList() {
         JDBCPool client = JDBCPoolInit.instance().getPool();
         Promise<JsonObject> promise = Promise.promise();
-        String sql = "SELECT * FROM playground_parser ORDER BY create_time DESC";
+        String sql = """
+                SELECT id, name, type, display_name, description, author, version,
+                       match_pattern, ip, create_time, update_time, enabled
+                FROM playground_parser
+                ORDER BY create_time DESC
+                LIMIT 100
+                """;
 
         client.query(sql).execute().onSuccess(rows -> {
             List<JsonObject> list = new ArrayList<>();
             for (Row row : rows) {
-                JsonObject parser = new JsonObject();
-                parser.put("id", row.getLong("id"));
-                parser.put("name", row.getString("name"));
-                parser.put("type", row.getString("type"));
-                parser.put("displayName", row.getString("display_name"));
-                parser.put("description", row.getString("description"));
-                parser.put("author", row.getString("author"));
-                parser.put("version", row.getString("version"));
-                parser.put("matchPattern", row.getString("match_pattern"));
-                parser.put("jsCode", row.getString("js_code"));
-                parser.put("ip", row.getString("ip"));
-                // 将LocalDateTime转换为字符串格式，避免序列化为数组
-                var createTime = row.getLocalDateTime("create_time");
-                if (createTime != null) {
-                    parser.put("createTime", createTime.toString().replace("T", " "));
-                }
-                var updateTime = row.getLocalDateTime("update_time");
-                if (updateTime != null) {
-                    parser.put("updateTime", updateTime.toString().replace("T", " "));
-                }
-                parser.put("enabled", row.getBoolean("enabled"));
-                list.add(parser);
+                list.add(toPlaygroundParserJson(row, false));
             }
             promise.complete(JsonResult.data(list).toJsonObject());
         }).onFailure(e -> {
             log.error("getPlaygroundParserList failed", e);
+            promise.fail(e);
+        });
+
+        return promise.future();
+    }
+
+    @Override
+    public Future<JsonObject> getEnabledPlaygroundParsersForLoad() {
+        JDBCPool client = JDBCPoolInit.instance().getPool();
+        Promise<JsonObject> promise = Promise.promise();
+        String sql = """
+                SELECT id, name, type, display_name, description, author, version,
+                       match_pattern, js_code, ip, create_time, update_time, enabled
+                FROM playground_parser
+                WHERE enabled = TRUE
+                ORDER BY update_time DESC, create_time DESC
+                LIMIT 100
+                """;
+
+        client.query(sql).execute().onSuccess(rows -> {
+            List<JsonObject> list = new ArrayList<>();
+            for (Row row : rows) {
+                list.add(toPlaygroundParserJson(row, true));
+            }
+            promise.complete(JsonResult.data(list).toJsonObject());
+        }).onFailure(e -> {
+            log.error("getEnabledPlaygroundParsersForLoad failed", e);
             promise.fail(e);
         });
 
@@ -165,13 +176,14 @@ public class DbServiceImpl implements DbService {
         
         String sql = """
             UPDATE playground_parser 
-            SET name = ?, display_name = ?, description = ?, author = ?, 
+            SET type = ?, name = ?, display_name = ?, description = ?, author = ?,
                 version = ?, match_pattern = ?, js_code = ?, update_time = NOW(), enabled = ?
             WHERE id = ?
             """;
 
         client.preparedQuery(sql)
             .execute(Tuple.of(
+                parser.getString("type"),
                 parser.getString("name"),
                 parser.getString("displayName"),
                 parser.getString("description"),
@@ -183,6 +195,10 @@ public class DbServiceImpl implements DbService {
                 id
             ))
             .onSuccess(res -> {
+                if (res.rowCount() == 0) {
+                    promise.complete(JsonResult.error("解析器不存在").toJsonObject());
+                    return;
+                }
                 promise.complete(JsonResult.success("更新成功").toJsonObject());
             })
             .onFailure(e -> {
@@ -232,6 +248,27 @@ public class DbServiceImpl implements DbService {
     }
 
     @Override
+    public Future<Boolean> playgroundParserTypeExists(String type, Long excludeId) {
+        JDBCPool client = JDBCPoolInit.instance().getPool();
+        Promise<Boolean> promise = Promise.promise();
+
+        String sql = excludeId == null
+                ? "SELECT COUNT(*) as count FROM playground_parser WHERE type = ?"
+                : "SELECT COUNT(*) as count FROM playground_parser WHERE type = ? AND id <> ?";
+        Tuple params = excludeId == null ? Tuple.of(type) : Tuple.of(type, excludeId);
+
+        client.preparedQuery(sql).execute(params).onSuccess(rows -> {
+            Integer count = rows.iterator().next().getInteger("count");
+            promise.complete(count != null && count > 0);
+        }).onFailure(e -> {
+            log.error("playgroundParserTypeExists failed", e);
+            promise.fail(e);
+        });
+
+        return promise.future();
+    }
+
+    @Override
     public Future<JsonObject> getPlaygroundParserById(Long id) {
         JDBCPool client = JDBCPoolInit.instance().getPool();
         Promise<JsonObject> promise = Promise.promise();
@@ -243,28 +280,7 @@ public class DbServiceImpl implements DbService {
             .onSuccess(rows -> {
                 if (rows.size() > 0) {
                     Row row = rows.iterator().next();
-                    JsonObject parser = new JsonObject();
-                    parser.put("id", row.getLong("id"));
-                    parser.put("name", row.getString("name"));
-                    parser.put("type", row.getString("type"));
-                    parser.put("displayName", row.getString("display_name"));
-                    parser.put("description", row.getString("description"));
-                    parser.put("author", row.getString("author"));
-                    parser.put("version", row.getString("version"));
-                    parser.put("matchPattern", row.getString("match_pattern"));
-                    parser.put("jsCode", row.getString("js_code"));
-                    parser.put("ip", row.getString("ip"));
-                    // 将LocalDateTime转换为字符串格式，避免序列化为数组
-                    var createTime = row.getLocalDateTime("create_time");
-                    if (createTime != null) {
-                        parser.put("createTime", createTime.toString().replace("T", " "));
-                    }
-                    var updateTime = row.getLocalDateTime("update_time");
-                    if (updateTime != null) {
-                        parser.put("updateTime", updateTime.toString().replace("T", " "));
-                    }
-                    parser.put("enabled", row.getBoolean("enabled"));
-                    promise.complete(JsonResult.data(parser).toJsonObject());
+                    promise.complete(JsonResult.data(toPlaygroundParserJson(row, true)).toJsonObject());
                 } else {
                     promise.fail("解析器不存在");
                 }
@@ -277,15 +293,48 @@ public class DbServiceImpl implements DbService {
         return promise.future();
     }
 
+    private JsonObject toPlaygroundParserJson(Row row, boolean includeJsCode) {
+        JsonObject parser = new JsonObject();
+        parser.put("id", row.getLong("id"));
+        parser.put("name", row.getString("name"));
+        parser.put("type", row.getString("type"));
+        parser.put("displayName", row.getString("display_name"));
+        parser.put("description", row.getString("description"));
+        parser.put("author", row.getString("author"));
+        parser.put("version", row.getString("version"));
+        parser.put("matchPattern", row.getString("match_pattern"));
+        if (includeJsCode) {
+            parser.put("jsCode", row.getString("js_code"));
+        }
+        parser.put("ip", row.getString("ip"));
+        var createTime = row.getLocalDateTime("create_time");
+        if (createTime != null) {
+            parser.put("createTime", createTime.toString().replace("T", " "));
+        }
+        var updateTime = row.getLocalDateTime("update_time");
+        if (updateTime != null) {
+            parser.put("updateTime", updateTime.toString().replace("T", " "));
+        }
+        parser.put("enabled", row.getBoolean("enabled"));
+        return parser;
+    }
+
     // ========== 捐赠账号相关 ==========
 
     @Override
     public Future<JsonObject> saveDonatedAccount(JsonObject account) {
         JDBCPool client = JDBCPoolInit.instance().getPool();
 
-        Future<String> encryptedUsername = CryptoUtil.encrypt(account.getString("username"));
-        Future<String> encryptedPassword = CryptoUtil.encrypt(account.getString("password"));
-        Future<String> encryptedToken = CryptoUtil.encrypt(account.getString("token"));
+        // 只保留当前认证方式实际用到的字段，避免调用方切换认证类型后遗留的用户名/密码脏数据
+        // 被一并存入库中，导致后续解析时被误当作真实凭证使用（例如把废弃的用户名当手机号登录）。
+        boolean isPasswordAuth = "password".equalsIgnoreCase(account.getString("authType"));
+        String usernameToStore = isPasswordAuth ? account.getString("username") : null;
+        String passwordToStore = isPasswordAuth ? account.getString("password") : null;
+        String tokenToStore = isPasswordAuth ? null : account.getString("token");
+
+        Future<String> encryptedUsername = CryptoUtil.encrypt(usernameToStore);
+        Future<String> encryptedPassword = CryptoUtil.encrypt(passwordToStore);
+        Future<String> encryptedToken = CryptoUtil.encrypt(tokenToStore);
 
         return ensureFailCountColumn(client).compose(v ->
                 Future.all(encryptedUsername, encryptedPassword, encryptedToken).compose(compositeFuture -> {
@@ -369,6 +418,14 @@ public class DbServiceImpl implements DbService {
                                     String username = usernameFuture.result();
                                     String password = passwordFuture.result();
                                     String token = tokenFuture.result();
+
+                                    // 历史脏数据兜底：非 password 认证类型的账号不应该带用户名/密码
+                                    // （例如切换认证类型前遗留的表单数据），否则会被解析器误当作真实账号密码去登录。
+                                    boolean isPasswordAuth = "password".equalsIgnoreCase(row.getString("auth_type"));
+                                    if (!isPasswordAuth) {
+                                        username = null;
+                                        password = null;
+                                    }
 
                                     // 如果解密后没有任何可用凭证，返回空对象，避免把密文当作明文认证参数下发给前端
                                     if (StringUtils.isBlank(username) && StringUtils.isBlank(password) && StringUtils.isBlank(token)) {

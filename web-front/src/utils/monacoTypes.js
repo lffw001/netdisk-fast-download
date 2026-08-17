@@ -83,9 +83,9 @@ function registerTypeDefinitions(monaco) {
       clearHeaders(): JsHttpClient;
       getHeaders(): Record<string, string>;
       setTimeout(seconds: number): JsHttpClient;
-      sendForm(data: Record<string, any>): JsHttpResponse;
+      sendForm(url: string, data: Record<string, any>): JsHttpResponse;
       sendMultipartForm(url: string, data: Record<string, any>): JsHttpResponse;
-      sendJson(data: any): JsHttpResponse;
+      sendJson(url: string, data: any): JsHttpResponse;
       urlEncode(str: string): string;
       urlDecode(str: string): string;
     }
@@ -244,17 +244,17 @@ function registerCompletionProvider(monaco) {
           range
         },
         {
-          label: 'http.sendForm(data)',
+          label: 'http.sendForm(url, data)',
           kind: monaco.languages.CompletionItemKind.Method,
-          insertText: 'http.sendForm(${1:data})',
+          insertText: 'http.sendForm(${1:url}, ${2:data})',
           insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
           documentation: '发送表单数据',
           range
         },
         {
-          label: 'http.sendJson(data)',
+          label: 'http.sendJson(url, data)',
           kind: monaco.languages.CompletionItemKind.Method,
-          insertText: 'http.sendJson(${1:data})',
+          insertText: 'http.sendJson(${1:url}, ${2:data})',
           insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
           documentation: '发送JSON数据',
           range
@@ -313,7 +313,6 @@ export async function loadTypesFromApi(monaco) {
           cachedContent,
           'file:///types.js'
         );
-        console.log('从缓存加载types.js成功');
         // 异步更新缓存
         updateTypesJsCache();
         return;
@@ -334,7 +333,6 @@ export async function loadTypesFromApi(monaco) {
         typesJsContent,
         'file:///types.js'
       );
-      console.log('加载types.js成功并已缓存');
     }
   } catch (error) {
     console.warn('加载types.js失败，使用内置类型定义:', error);
@@ -350,7 +348,6 @@ async function updateTypesJsCache() {
     if (response.ok) {
       const typesJsContent = await response.text();
       localStorage.setItem('playground_types_js', typesJsContent);
-      console.log('types.js缓存已更新');
     }
   } catch (error) {
     console.warn('更新types.js缓存失败:', error);

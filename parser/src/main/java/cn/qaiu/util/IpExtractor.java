@@ -1,10 +1,12 @@
 package cn.qaiu.util;
 
+import cn.qaiu.WebClientVertxInit;
 import io.vertx.core.MultiMap;
-import io.vertx.core.Vertx;
 import io.vertx.core.http.impl.headers.HeadersMultiMap;
 import io.vertx.ext.web.client.WebClient;
 import io.vertx.ext.web.client.WebClientSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -15,6 +17,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class IpExtractor {
+    private static final Logger log = LoggerFactory.getLogger(IpExtractor.class);
+
+    // 使用共享的 Vertx 实例，避免每次调用创建新实例导致资源泄漏
+    private static final WebClient SHARED_CLIENT = WebClient.create(WebClientVertxInit.get());
+    private static final WebClientSession SHARED_SESSION = WebClientSession.create(SHARED_CLIENT);
+
     public static void main(String[] args) throws InterruptedException {
 
 
@@ -39,12 +47,10 @@ public class IpExtractor {
         headers.add("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36");
         headers.add("Content-Type", "application/x-www-form-urlencoded");
 
-        WebClient client = WebClient.create(Vertx.vertx());
-        WebClientSession webClientSession = WebClientSession.create(client);
-        webClientSession.getAbs("https://ip.ihuan.me").putHeaders(headers).send().onSuccess(res->{
-            System.out.println(res.toString());
-            webClientSession.getAbs("https://ip.ihuan.me").putHeaders(headers).send().onSuccess(res2->{
-                System.out.println(res2.toString());
+        SHARED_SESSION.getAbs("https://ip.ihuan.me").putHeaders(headers).send().onSuccess(res->{
+            log.debug("response: {}", res.toString());
+            SHARED_SESSION.getAbs("https://ip.ihuan.me").putHeaders(headers).send().onSuccess(res2->{
+                log.debug("response2: {}", res2.toString());
 
             });
         });

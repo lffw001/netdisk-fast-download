@@ -2,6 +2,7 @@ package cn.qaiu.parser.impl;
 
 import cn.qaiu.entity.FileInfo;
 import cn.qaiu.entity.ShareLinkInfo;
+import cn.qaiu.parser.IPanTool;
 import cn.qaiu.parser.PanBase;
 import io.vertx.core.Future;
 import io.vertx.core.buffer.Buffer;
@@ -42,6 +43,7 @@ public class CeTool extends PanBase {
         String pwd = shareLinkInfo.getSharePassword();
         try {
             URL url = new URL(shareLinkInfo.getShareUrl());
+            assertPublicHost(url);
             String baseUrl = url.getProtocol() + "://" + url.getHost();
             // 如果有端口，拼接上端口
             if (url.getPort() != -1) {
@@ -76,7 +78,8 @@ public class CeTool extends PanBase {
     private void tryV4Ping(String baseUrl, String key, String pwd) {
         String pingUrlV4 = baseUrl + PING_API_V4_PATH;
         
-        clientSession.getAbs(pingUrlV4).send().onSuccess(res -> {
+        // 禁止跟随重定向：assertPublicHost 只校验初始 host，自动 30x 会绕过 SSRF 防护
+        clientNoRedirects.getAbs(pingUrlV4).send().onSuccess(res -> {
             if (res.statusCode() == 200) {
                 try {
                     JsonObject json = asJson(res);
@@ -106,7 +109,7 @@ public class CeTool extends PanBase {
     private void tryV3Ping(String baseUrl, String key, String pwd) {
         String pingUrlV3 = baseUrl + PING_API_V3_PATH;
         
-        clientSession.getAbs(pingUrlV3).send().onSuccess(res -> {
+        clientNoRedirects.getAbs(pingUrlV3).send().onSuccess(res -> {
             if (res.statusCode() == 200) {
                 try {
                     JsonObject json = asJson(res);
@@ -137,7 +140,7 @@ public class CeTool extends PanBase {
      */
     private void verifyV3AndParse(String baseUrl, String key, String pwd) {
         String shareApiUrl = baseUrl + SHARE_API_PATH + key;
-        HttpRequest<Buffer> httpRequest = clientSession.getAbs(shareApiUrl);
+        HttpRequest<Buffer> httpRequest = clientNoRedirects.getAbs(shareApiUrl);
         if (pwd != null && !pwd.isEmpty()) {
             httpRequest.addQueryParam("password", pwd);
         }
@@ -160,6 +163,7 @@ public class CeTool extends PanBase {
             } catch (Exception e) {
                 log.debug("v3 share API解析失败: {}", e.getMessage());
             }
+            tryV4ShareApi(baseUrl, key, pwd);
         }).onFailure(t -> {
             log.debug("v3 share API请求失败: {}", t.getMessage());
             // 请求失败，尝试 v4 或下一个解析器
@@ -172,7 +176,7 @@ public class CeTool extends PanBase {
      */
     private void tryV4ShareApi(String baseUrl, String key, String pwd) {
         String shareApiUrl = baseUrl + "/api/v4/share/info/" + key;
-        HttpRequest<Buffer> httpRequest = clientSession.getAbs(shareApiUrl);
+        HttpRequest<Buffer> httpRequest = clientNoRedirects.getAbs(shareApiUrl);
         if (pwd != null && !pwd.isEmpty()) {
             httpRequest.addQueryParam("password", pwd);
         }
@@ -206,7 +210,8 @@ public class CeTool extends PanBase {
      */
     private void delegateToCe4Tool() {
         log.debug("检测到Cloudreve 4.x，转发到Ce4Tool处理");
-        new Ce4Tool(shareLinkInfo).parse().onComplete(promise);
+        Ce4Tool ce4Tool = new Ce4Tool(shareLinkInfo);
+        IPanTool.closeAfter(ce4Tool, ce4Tool::parse).onComplete(promise);
     }
 
 
@@ -287,7 +292,8 @@ public class CeTool extends PanBase {
     }
 
     private void getDownURL(String shareApiUrl) {
-        clientSession.putAbs(shareApiUrl)
+        // PUT 默认不跟随重定向，但仍统一使用 no-redirect 客户端避免配置漂移
+        clientNoRedirects.putAbs(shareApiUrl)
                 .putHeader("Referer", shareLinkInfo.getShareUrl())
                 .send().onSuccess(res -> {
             JsonObject jsonObject = asJson(res);

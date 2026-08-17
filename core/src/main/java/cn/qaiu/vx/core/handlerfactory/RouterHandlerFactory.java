@@ -34,6 +34,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -96,7 +97,9 @@ public class RouterHandlerFactory implements BaseHttpApi {
         mainRouter.route().handler(CorsHandler.create().addRelativeOrigin(".*").allowCredentials(true).allowedMethods(httpMethods));
 
         // 配置文件上传路径
-        mainRouter.route().handler(BodyHandler.create().setUploadsDirectory("uploads"));
+        mainRouter.route().handler(BodyHandler.create()
+                .setUploadsDirectory("uploads")
+                .setBodyLimit(2L * 1024 * 1024));
 
         // 拦截器
         Set<Handler<RoutingContext>> interceptorSet = getInterceptorSet();
@@ -127,8 +130,9 @@ public class RouterHandlerFactory implements BaseHttpApi {
         // 错误请求处理
         mainRouter.errorHandler(405, ctx -> doFireJsonResultResponse(ctx, JsonResult
                 .error("Method Not Allowed", 405)));
-        mainRouter.errorHandler(404, ctx -> ctx.response().setStatusCode(404).setChunked(true)
-                .end("Internal server error: 404 not found"));
+        mainRouter.errorHandler(404, ctx -> {
+            ctx.response().setStatusCode(404).end("404 not found");
+        });
 
         return mainRouter;
     }
@@ -174,13 +178,14 @@ public class RouterHandlerFactory implements BaseHttpApi {
                 route.handler(TimeoutHandler.create(SharedDataUtil.getCustomConfig().getInteger(ROUTE_TIME_OUT)));
                 route.handler(ResponseTimeHandler.create());
                 route.handler(ctx -> handlerMethod(instance, method, ctx)).failureHandler(ctx -> {
-                    if (ctx.response().ended()) return;
+                    if (isResponseDone(ctx)) return;
                     // 超时处理器状态码503
                     if (ctx.statusCode() == 503 || ctx.failure() == null) {
                         doFireJsonResultResponse(ctx, JsonResult.error("未知异常, 请联系管理员"), 503);
                     } else {
-                        ctx.failure().printStackTrace();
-                        doFireJsonResultResponse(ctx, JsonResult.error(ctx.failure().getMessage()), 500);
+                        LOGGER.error("路由处理失败", ctx.failure());
+                        String msg = ctx.failure() != null ? ctx.failure().getMessage() : "未知异常";
+                        doFireJsonResultResponse(ctx, JsonResult.error(msg), 500);
                     }
                 });
             } else if (method.isAnnotationPresent(SockRouteMapper.class)) {
@@ -198,7 +203,7 @@ public class RouterHandlerFactory implements BaseHttpApi {
                     try {
                         ReflectionUtil.invokeWithArguments(method, instance, sock);
                     } catch (Throwable e) {
-                        e.printStackTrace();
+                        LOGGER.error("WebSocket处理异常", e);
                     }
                 });
                 if (url.endsWith("*")) {
@@ -322,7 +327,7 @@ public class RouterHandlerFactory implements BaseHttpApi {
                                 parameterValueList.put(k, entity);
                             }
                         } catch (ClassNotFoundException e) {
-                            e.printStackTrace();
+                            LOGGER.error("实体类绑定异常: {}", typeName, e);
                         }
                     }
                 });
@@ -365,7 +370,7 @@ public class RouterHandlerFactory implements BaseHttpApi {
                     Object entity = ParamUtil.multiMapToEntity(queryParams, aClass);
                     parameterValueList.put(k, entity);
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    LOGGER.error("参数绑定异常: {}", v.getRight().getName(), e);
                 }
             } else if (parameterValueList.get(k) == null
                     && JsonObject.class.getName().equals(v.getRight().getName())) {
@@ -392,38 +397,43 @@ public class RouterHandlerFactory implements BaseHttpApi {
 
                 if (data instanceof JsonResult jsonResult) {
                     doFireJsonResultResponse(ctx, (JsonResult<?>) data, jsonResult.getCode());
-                }
-                if (data instanceof JsonObject) {
+                } else if (data instanceof JsonObject) {
                     doFireJsonObjectResponse(ctx, ((JsonObject) data));
                 } else if (data instanceof Future) { // 处理异步响应
-                    ((Future<?>) data).onSuccess(res -> {
-                        if (res instanceof JsonResult jsonResult) {
-                            doFireJsonResultResponse(ctx, jsonResult, jsonResult.getCode());
+                    Future<?> responseFuture = (Future<?>) data;
+                    AtomicReference<RoutingContext> ctxRef = new AtomicReference<>(ctx);
+                    ctx.addEndHandler(v -> ctxRef.set(null));
+                    responseFuture.onComplete(ar -> {
+                        RoutingContext responseCtx = ctxRef.getAndSet(null);
+                        if (responseCtx == null || isResponseDone(responseCtx)) {
+                            return;
                         }
-                        if (res instanceof JsonObject) {
-                            doFireJsonObjectResponse(ctx, ((JsonObject) res));
-                        } else if (res != null) {
-                            doFireJsonResultResponse(ctx, JsonResult.data(res));
+                        if (ar.succeeded()) {
+                            Object res = ar.result();
+                            if (res instanceof JsonResult jsonResult) {
+                                doFireJsonResultResponse(responseCtx, jsonResult, jsonResult.getCode());
+                            } else if (res instanceof JsonObject) {
+                                doFireJsonObjectResponse(responseCtx, ((JsonObject) res));
+                            } else if (res != null) {
+                                doFireJsonResultResponse(responseCtx, JsonResult.data(res));
+                            } else {
+                                doFireJsonResultResponse(responseCtx, JsonResult.data(null));
+                            }
                         } else {
-                            doFireJsonResultResponse(ctx, JsonResult.data(null));
+                            Throwable e = ar.cause();
+                            LOGGER.error("请求处理失败", e);
+                            String msg = e != null && e.getMessage() != null ? e.getMessage() : "服务器内部错误";
+                            doFireJsonResultResponse(responseCtx, JsonResult.error(msg), 500);
                         }
-
-                    }).onFailure(e -> doFireJsonResultResponse(ctx, JsonResult.error(e.getMessage()), 500));
+                    });
                 } else {
                     doFireJsonResultResponse(ctx, JsonResult.data(data));
                 }
             }
         } catch (Throwable e) {
-            e.printStackTrace();
-            String err = e.getMessage();
-            if (e.getCause() != null) {
-                if (e.getCause() instanceof InvocationTargetException) {
-                    err = ((InvocationTargetException) e.getCause()).getTargetException().getMessage();
-                } else {
-                    err = e.getCause().getMessage();
-                }
-            }
-            doFireJsonResultResponse(ctx, JsonResult.error(err), 500);
+            LOGGER.error("请求处理异常", e);
+            String msg = e.getMessage() != null ? e.getMessage() : "服务器内部错误";
+            doFireJsonResultResponse(ctx, JsonResult.error(msg), 500);
         }
     }
 

@@ -21,11 +21,11 @@ import static cn.qaiu.util.AESUtils.encrypt;
  */
 public class JsExecUtils {
     private static final Invocable inv;
+    private static final ScriptEngineManager ENGINE_MANAGER = new ScriptEngineManager();
 
     // 初始化脚本引擎
     static {
-        ScriptEngineManager engineManager = new ScriptEngineManager();
-        ScriptEngine engine = engineManager.getEngineByName("JavaScript"); // 得到脚本引擎
+        ScriptEngine engine = ENGINE_MANAGER.getEngineByName("JavaScript"); // 得到脚本引擎
 
         try {
             engine.eval(JsContent.ye123);
@@ -45,37 +45,89 @@ public class JsExecUtils {
     }
 
     /**
-     * 调用执行蓝奏云js文件
+     * 调用执行蓝奏云js文件（每次动态JS代码，无法复用引擎）
+     * 注意：使用后清理引擎引用，帮助 GC 回收 Nashorn 引擎内部资源
      */
     public static ScriptObjectMirror executeDynamicJs(String jsText, String funName) throws ScriptException,
             NoSuchMethodException {
-        ScriptEngineManager engineManager = new ScriptEngineManager();
-        ScriptEngine engine = engineManager.getEngineByName("JavaScript"); // 得到脚本引擎
-        engine.eval(JsContent.lz + "\n" + jsText);
-        Invocable inv = (Invocable) engine;
-        //调用js中的函数
-        if (StringUtils.isNotEmpty(funName)) {
-            inv.invokeFunction(funName);
-        }
+        return executeDynamicJs(jsText, funName, null);
+    }
 
-        return (ScriptObjectMirror) engine.get("signObj");
+    /**
+     * @param pwd 分享密码，写入伪 DOM（#pwd / getElementById('pwd')），供新版页面取值
+     */
+    public static ScriptObjectMirror executeDynamicJs(String jsText, String funName, String pwd) throws ScriptException,
+            NoSuchMethodException {
+        ScriptEngine engine = ENGINE_MANAGER.getEngineByName("JavaScript");
+        try {
+            engine.eval(JsContent.lz);
+            Invocable inv = (Invocable) engine;
+            if (pwd != null) {
+                inv.invokeFunction("__lzSetPwd", pwd);
+            }
+            try {
+                engine.eval(jsText);
+                if (StringUtils.isNotEmpty(funName)) {
+                    inv.invokeFunction(funName);
+                }
+            } catch (ScriptException | NoSuchMethodException | RuntimeException e) {
+                ScriptObjectMirror captured = asSignObj(engine.get("signObj"));
+                if (captured != null) {
+                    return captured;
+                }
+                throw e;
+            }
+            return asSignObj(engine.get("signObj"));
+        } finally {
+            clearEngineBindings(engine);
+        }
+    }
+
+    private static ScriptObjectMirror asSignObj(Object sign) {
+        if (sign instanceof ScriptObjectMirror mirror
+                && (mirror.get("url") != null || mirror.get("data") != null)) {
+            return mirror;
+        }
+        return null;
     }
 
 
     /**
-     * 调用执行蓝奏云js文件
+     * 调用执行js文件（使用缓存的 ScriptEngineManager 创建新引擎实例）
+     * 注意：使用后清理引擎引用，帮助 GC 回收 Nashorn 引擎内部资源
      */
     public static Object executeOtherJs(String jsText, String funName, Object ... args) throws ScriptException,
             NoSuchMethodException {
-        ScriptEngineManager engineManager = new ScriptEngineManager();
-        ScriptEngine engine = engineManager.getEngineByName("JavaScript"); // 得到脚本引擎
-        engine.eval(jsText);
-        Invocable inv = (Invocable) engine;
-        //调用js中的函数
-        if (StringUtils.isNotEmpty(funName)) {
-            return inv.invokeFunction(funName, args);
+        ScriptEngine engine = ENGINE_MANAGER.getEngineByName("JavaScript"); // 得到脚本引擎
+        try {
+            engine.eval(jsText);
+            Invocable inv = (Invocable) engine;
+            //调用js中的函数
+            if (StringUtils.isNotEmpty(funName)) {
+                return inv.invokeFunction(funName, args);
+            }
+            throw new ScriptException("funName is null");
+        } finally {
+            // 清理引擎持有的引用，帮助 GC 回收
+            clearEngineBindings(engine);
         }
-        throw new ScriptException("funName is null");
+    }
+
+    /**
+     * 清理 ScriptEngine 的 bindings，帮助 GC 回收 Nashorn 引擎资源
+     */
+    private static void clearEngineBindings(ScriptEngine engine) {
+        try {
+            if (engine != null) {
+                // 清理全局 bindings
+                var bindings = engine.getBindings(javax.script.ScriptContext.ENGINE_SCOPE);
+                if (bindings != null) {
+                    bindings.clear();
+                }
+            }
+        } catch (Exception ignored) {
+            // 清理失败不影响主流程
+        }
     }
 
     public static String getKwSign(String s, String pwd) {

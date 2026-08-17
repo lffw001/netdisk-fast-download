@@ -22,22 +22,22 @@ public class RouterVerticle extends AbstractVerticle {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RouterVerticle.class);
 
-    private static final int port = SharedDataUtil.getValueForServerConfig("port");
-    private static final Router router = new RouterHandlerFactory(
-            SharedDataUtil.getJsonStringForServerConfig("contextPath")).createRouter();
-
-    private static final JsonObject globalConfig = SharedDataUtil.getJsonConfig("globalConfig");
-
     private HttpServer server;
+    private Router router;
+    private int port;
+    private JsonObject globalConfig;
 
     static {
         LOGGER.info(JacksonConfig.class.getSimpleName() + " >> ");
         JacksonConfig.nothing();
-        LOGGER.info("To start listening to port {} ......", port);
     }
 
     @Override
     public void start(Promise<Void> startPromise) {
+        port = SharedDataUtil.getValueForServerConfig("port");
+        globalConfig = SharedDataUtil.getJsonConfig("globalConfig");
+        LOGGER.info("To start listening to port {} ......", port);
+
         // 端口是否占用
         if (CommonUtil.isPortUsing(port)) {
             throw new RuntimeException("Start fail: the '" + port + "' port is already in use...");
@@ -61,9 +61,11 @@ public class RouterVerticle extends AbstractVerticle {
                .setReuseAddress(true)                     // 允许地址重用
                .setReusePort(true);                       // 允许端口重用
         
+        router = new RouterHandlerFactory(
+                SharedDataUtil.getJsonStringForServerConfig("contextPath")).createRouter();
         server = vertx.createHttpServer(options);
 
-        server.requestHandler(router).webSocketHandler(s->{}).listen()
+        server.requestHandler(router).listen()
                 .onSuccess(s -> startPromise.complete())
                 .onFailure(e -> startPromise.fail(e.getCause()));
     }
